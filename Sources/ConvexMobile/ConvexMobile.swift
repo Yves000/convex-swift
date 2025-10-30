@@ -5,6 +5,35 @@ import Combine
 import Foundation
 @_exported import UniFFI
 
+// MARK: - JWT Helper
+
+/// Helper struct to decode JWT tokens and extract expiration information
+private struct JWTDecoder {
+  /// Decodes a JWT token and returns the expiration date if available
+  static func extractExpiration(from token: String) -> Date? {
+    let segments = token.components(separatedBy: ".")
+    guard segments.count >= 2 else {
+      return nil
+    }
+
+    let payloadSegment = segments[1]
+    var base64 = payloadSegment
+      .replacingOccurrences(of: "-", with: "+")
+      .replacingOccurrences(of: "_", with: "/")
+
+    let paddingLength = (4 - base64.count % 4) % 4
+    base64 += String(repeating: "=", count: paddingLength)
+
+    guard let payloadData = Data(base64Encoded: base64),
+          let json = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any],
+          let exp = json["exp"] as? TimeInterval else {
+      return nil
+    }
+
+    return Date(timeIntervalSince1970: exp)
+  }
+}
+
 /// A client API for interacting with a Convex backend.
 ///
 /// Handles marshalling of data between calling code and the
@@ -171,6 +200,12 @@ public enum AuthState<T> {
   case loading
 }
 
+/// Errors that can occur during authentication operations.
+public enum AuthProviderError: Error {
+  /// The authentication provider does not support token refresh.
+  case refreshNotSupported
+}
+
 /// An authentication provider, used with ``ConvexClientWithAuth``.
 ///
 /// The generic type `T` is the data returned by the provider upon a successful authentication attempt.
@@ -186,6 +221,37 @@ public protocol AuthProvider<T> {
   /// Extracts a [JWT ID token](https://openid.net/specs/openid-connect-core-1_0.html#IDToken)
   /// from the `authResult`.
   func extractIdToken(from authResult: T) -> String
+
+  /// Refreshes the authentication data to obtain a new token.
+  ///
+  /// This method is called automatically by the client when the current token is about to expire.
+  /// The default implementation throws ``AuthProviderError/refreshNotSupported``.
+  ///
+  /// Override this method if your authentication provider supports token refresh.
+  ///
+  /// - Parameter authResult: The current authentication data.
+  /// - Returns: New authentication data with a fresh token.
+  /// - Throws: ``AuthProviderError/refreshNotSupported`` by default, or other errors during refresh.
+  func refreshToken(from authResult: T) async throws -> T
+}
+
+/// Default implementation of ``AuthProvider`` optional methods.
+extension AuthProvider {
+  /// Default implementation that throws ``AuthProviderError/refreshNotSupported``.
+  ///
+  /// Override this method in your AuthProvider implementation to enable automatic token refresh.
+  ///
+  /// Example:
+  /// ```swift
+  /// extension MyAuthProvider {
+  ///   public func refreshToken(from authResult: Credentials) async throws -> Credentials {
+  ///     return try await myAPI.refreshToken(authResult.refreshToken)
+  ///   }
+  /// }
+  /// ```
+  public func refreshToken(from authResult: T) async throws -> T {
+    throw AuthProviderError.refreshNotSupported
+  }
 }
 
 /// Like ``ConvexClient``, but supports integration with an authentication provider via ``AuthProvider``.
