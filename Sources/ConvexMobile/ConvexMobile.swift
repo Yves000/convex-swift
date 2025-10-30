@@ -44,17 +44,51 @@ class TokenRefreshManager<T> {
   private var refreshTimer: AnyCancellable?
   private var currentAuthData: T?
   private let refreshLeewaySeconds: TimeInterval
+  private let maxRetries: Int
+  private let baseRetryDelay: TimeInterval
+  private var isRefreshing = false
 
   init(
     authProvider: any AuthProvider<T>,
     refreshLeewaySeconds: TimeInterval = 60,
     onTokenRefreshed: @escaping (String) async throws -> Void,
-    onRefreshFailed: @escaping (Error) -> Void
+    onRefreshFailed: @escaping (Error) -> Void,
+    maxRetries: Int = 3,
+    baseRetryDelay: TimeInterval = 2
   ) {
     self.authProvider = authProvider
     self.refreshLeewaySeconds = refreshLeewaySeconds
     self.onTokenRefreshed = onTokenRefreshed
     self.onRefreshFailed = onRefreshFailed
+    self.maxRetries = maxRetries
+    self.baseRetryDelay = baseRetryDelay
+  }
+
+  private func isTransientError(_ error: Error) -> Bool {
+    let nsError = error as NSError
+
+    if nsError.domain == NSURLErrorDomain {
+      switch nsError.code {
+      case NSURLErrorTimedOut,
+           NSURLErrorCannotConnectToHost,
+           NSURLErrorNetworkConnectionLost,
+           NSURLErrorNotConnectedToInternet,
+           NSURLErrorSecureConnectionFailed,
+           NSURLErrorServerCertificateUntrusted,
+           NSURLErrorServerCertificateHasUnknownRoot,
+           NSURLErrorServerCertificateNotYetValid,
+           -1200:
+        return true
+      default:
+        return false
+      }
+    }
+
+    if nsError.domain == "kCFErrorDomainCFNetwork" || nsError.domain == String(kCFErrorDomainCFNetwork) {
+      return abs(nsError.code) >= 9800 && abs(nsError.code) <= 9900
+    }
+
+    return false
   }
 
   func startMonitoring(authData: T) {
@@ -70,8 +104,11 @@ class TokenRefreshManager<T> {
     let timeUntilRefresh = max(0, timeUntilExpiration - refreshLeewaySeconds)
 
     if timeUntilRefresh <= 0 {
+      // Token already expired - wait briefly for network to stabilize before refreshing
+      let networkStabilizationDelay: TimeInterval = 3.0
       Task { [weak self] in
-        await self?.performRefresh()
+        try? await Task.sleep(nanoseconds: UInt64(networkStabilizationDelay * 1_000_000_000))
+        await self?.performRefreshWithRetry()
       }
       return
     }
@@ -81,7 +118,7 @@ class TokenRefreshManager<T> {
       .first()
       .sink { [weak self] _ in
         Task {
-          await self?.performRefresh()
+          await self?.performRefreshWithRetry()
         }
       }
   }
@@ -90,12 +127,21 @@ class TokenRefreshManager<T> {
     refreshTimer?.cancel()
     refreshTimer = nil
     currentAuthData = nil
+    isRefreshing = false
   }
 
-  private func performRefresh() async {
+  private func performRefreshWithRetry(retryAttempt: Int = 0) async {
     guard let authData = currentAuthData else {
       return
     }
+
+    // Prevent concurrent refresh attempts
+    guard !isRefreshing else {
+      return
+    }
+
+    isRefreshing = true
+    defer { isRefreshing = false }
 
     do {
       let newAuthData = try await authProvider.refreshToken(from: authData)
@@ -104,11 +150,24 @@ class TokenRefreshManager<T> {
       currentAuthData = newAuthData
       try await onTokenRefreshed(newToken)
 
+      // Schedule next refresh
       startMonitoring(authData: newAuthData)
     } catch AuthProviderError.refreshNotSupported {
+      // Provider doesn't support refresh
       return
     } catch {
-      onRefreshFailed(error)
+      let isTransient = isTransientError(error)
+
+      // Retry transient errors with exponential backoff
+      if isTransient && retryAttempt < maxRetries {
+        let delay = baseRetryDelay * pow(2.0, Double(retryAttempt))
+        isRefreshing = false
+        try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+        await performRefreshWithRetry(retryAttempt: retryAttempt + 1)
+      } else {
+        // Permanent error or max retries exceeded
+        onRefreshFailed(error)
+      }
     }
   }
 }
