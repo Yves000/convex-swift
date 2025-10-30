@@ -34,6 +34,85 @@ private struct JWTDecoder {
   }
 }
 
+// MARK: - Token Refresh Manager
+
+/// Manages automatic token refresh for authenticated Convex clients.
+class TokenRefreshManager<T> {
+  private let authProvider: any AuthProvider<T>
+  private let onTokenRefreshed: (String) async throws -> Void
+  private let onRefreshFailed: (Error) -> Void
+  private var refreshTimer: AnyCancellable?
+  private var currentAuthData: T?
+  private let refreshLeewaySeconds: TimeInterval
+
+  init(
+    authProvider: any AuthProvider<T>,
+    refreshLeewaySeconds: TimeInterval = 60,
+    onTokenRefreshed: @escaping (String) async throws -> Void,
+    onRefreshFailed: @escaping (Error) -> Void
+  ) {
+    self.authProvider = authProvider
+    self.refreshLeewaySeconds = refreshLeewaySeconds
+    self.onTokenRefreshed = onTokenRefreshed
+    self.onRefreshFailed = onRefreshFailed
+  }
+
+  func startMonitoring(authData: T) {
+    stopMonitoring()
+    currentAuthData = authData
+
+    let token = authProvider.extractIdToken(from: authData)
+    guard let expirationDate = JWTDecoder.extractExpiration(from: token) else {
+      return
+    }
+
+    let timeUntilExpiration = expirationDate.timeIntervalSinceNow
+    let timeUntilRefresh = max(0, timeUntilExpiration - refreshLeewaySeconds)
+
+    if timeUntilRefresh <= 0 {
+      Task { [weak self] in
+        await self?.performRefresh()
+      }
+      return
+    }
+
+    refreshTimer = Timer.publish(every: timeUntilRefresh, on: .main, in: .common)
+      .autoconnect()
+      .first()
+      .sink { [weak self] _ in
+        Task {
+          await self?.performRefresh()
+        }
+      }
+  }
+
+  func stopMonitoring() {
+    refreshTimer?.cancel()
+    refreshTimer = nil
+    currentAuthData = nil
+  }
+
+  private func performRefresh() async {
+    guard let authData = currentAuthData else {
+      return
+    }
+
+    do {
+      let newAuthData = try await authProvider.refreshToken(from: authData)
+      let newToken = authProvider.extractIdToken(from: newAuthData)
+
+      currentAuthData = newAuthData
+      try await onTokenRefreshed(newToken)
+
+      startMonitoring(authData: newAuthData)
+    } catch AuthProviderError.refreshNotSupported {
+      return
+    } catch {
+      onRefreshFailed(error)
+    }
+  }
+}
+
 /// A client API for interacting with a Convex backend.
 ///
 /// Handles marshalling of data between calling code and the
@@ -256,6 +335,7 @@ extension AuthProvider {
 public class ConvexClientWithAuth<T>: ConvexClient {
   private let authPublisher = CurrentValueSubject<AuthState<T>, Never>(AuthState.unauthenticated)
   private let authProvider: any AuthProvider<T>
+  private var tokenRefreshManager: TokenRefreshManager<T>?
 
   /// A publisher that updates with the current ``AuthState`` of this client instance.
   public let authState: AnyPublisher<AuthState<T>, Never>
@@ -269,12 +349,31 @@ public class ConvexClientWithAuth<T>: ConvexClient {
     self.authProvider = authProvider
     self.authState = authPublisher.eraseToAnyPublisher()
     super.init(deploymentUrl: deploymentUrl)
+    setupTokenRefreshManager()
   }
 
   init(ffiClient: MobileConvexClientProtocol, authProvider: any AuthProvider<T>) {
     self.authProvider = authProvider
     self.authState = authPublisher.eraseToAnyPublisher()
     super.init(ffiClient: ffiClient)
+    setupTokenRefreshManager()
+  }
+
+  private func setupTokenRefreshManager() {
+    tokenRefreshManager = TokenRefreshManager(
+      authProvider: authProvider,
+      refreshLeewaySeconds: 60,
+      onTokenRefreshed: { [weak self] newToken in
+        guard let self = self else { return }
+        try await self.ffiClient.setAuth(token: newToken)
+      },
+      onRefreshFailed: { [weak self] error in
+        guard let self = self else { return }
+        Task {
+          await self.logout()
+        }
+      }
+    )
   }
 
   /// Triggers a UI driven login flow and updates the ``authState``.
@@ -304,6 +403,8 @@ public class ConvexClientWithAuth<T>: ConvexClient {
   ///
   /// The ``authState`` will change to ``AuthState.unauthenticated`` if logout is successful.
   public func logout() async {
+    tokenRefreshManager?.stopMonitoring()
+
     do {
       try await authProvider.logout()
       try await ffiClient.setAuth(token: nil)
@@ -318,6 +419,10 @@ public class ConvexClientWithAuth<T>: ConvexClient {
     do {
       let authData = try await strategy()
       try await ffiClient.setAuth(token: authProvider.extractIdToken(from: authData))
+
+      // Start monitoring token expiration for automatic refresh
+      tokenRefreshManager?.startMonitoring(authData: authData)
+
       authPublisher.send(AuthState.authenticated(authData))
       return Result.success(authData)
     } catch {
