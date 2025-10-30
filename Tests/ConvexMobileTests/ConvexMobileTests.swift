@@ -326,6 +326,24 @@ final class ConvexMobileTests: XCTestCase {
     XCTAssertEqual(try result.get(), FakeAuthProvider.CREDENTIALS)
     XCTAssertEqual(credentials, FakeAuthProvider.CREDENTIALS)
   }
+
+  func testProviderWithoutRefreshSupport() async throws {
+    let provider = FakeAuthProvider()
+
+    do {
+      _ = try await provider.refreshToken(from: "old_token")
+      XCTFail("Expected refreshNotSupported error")
+    } catch AuthProviderError.refreshNotSupported {
+      // Expected
+    }
+  }
+
+  func testProviderWithRefreshSupport() async throws {
+    let provider = FakeRefreshableAuthProvider()
+    let newCreds = try await provider.refreshToken(from: "old_token")
+
+    XCTAssertEqual(newCreds, "refreshed_token")
+  }
 }
 
 class FakeMobileConvexClient: UniFFI.MobileConvexClientProtocol {
@@ -413,6 +431,27 @@ class FakeAuthProvider: AuthProvider {
 
   func extractIdToken(from authResult: String) -> String {
     return "extracted: \(authResult)"
+  }
+}
+
+class FakeRefreshableAuthProvider: AuthProvider {
+  func loginFromCache() async throws -> String {
+    return "old_token"
+  }
+
+  func login() async throws -> String {
+    return "old_token"
+  }
+
+  func logout() async throws {
+  }
+
+  func extractIdToken(from authResult: String) -> String {
+    return "extracted: \(authResult)"
+  }
+
+  func refreshToken(from authResult: String) async throws -> String {
+    return "refreshed_token"
   }
 }
 
