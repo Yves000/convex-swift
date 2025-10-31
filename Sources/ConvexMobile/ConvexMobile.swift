@@ -7,6 +7,9 @@ import Foundation
 #if canImport(UIKit)
 import UIKit
 #endif
+#if canImport(Network)
+import Network
+#endif
 
 // MARK: - JWT Helper
 
@@ -53,6 +56,10 @@ class TokenRefreshManager<T> {
   #if canImport(UIKit)
   private var appLifecycleObserver: NSObjectProtocol?
   #endif
+  #if canImport(Network)
+  private var pathMonitor: NWPathMonitor?
+  private var isWaitingForNetwork = false
+  #endif
 
   init(
     authProvider: any AuthProvider<T>,
@@ -88,6 +95,14 @@ class TokenRefreshManager<T> {
       NotificationCenter.default.removeObserver(observer)
     }
     #endif
+    #if canImport(Network)
+    pathMonitor?.cancel()
+    #endif
+  }
+
+  private func isOfflineError(_ error: Error) -> Bool {
+    let nsError = error as NSError
+    return nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorNotConnectedToInternet
   }
 
   private func isTransientError(_ error: Error) -> Bool {
@@ -98,7 +113,6 @@ class TokenRefreshManager<T> {
       case NSURLErrorTimedOut,
            NSURLErrorCannotConnectToHost,
            NSURLErrorNetworkConnectionLost,
-           NSURLErrorNotConnectedToInternet,
            NSURLErrorSecureConnectionFailed,
            NSURLErrorServerCertificateUntrusted,
            NSURLErrorServerCertificateHasUnknownRoot,
@@ -172,6 +186,40 @@ class TokenRefreshManager<T> {
     }
   }
 
+  #if canImport(Network)
+  private func waitForNetworkAndRetry() async {
+    guard !isWaitingForNetwork else {
+      return
+    }
+
+    isWaitingForNetwork = true
+
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+      let monitor = NWPathMonitor()
+      pathMonitor = monitor
+
+      monitor.pathUpdateHandler = { [weak self] path in
+        guard let self = self else {
+          continuation.resume()
+          return
+        }
+
+        if path.status == .satisfied {
+          self.pathMonitor?.cancel()
+          self.pathMonitor = nil
+          self.isWaitingForNetwork = false
+          continuation.resume()
+        }
+      }
+
+      let queue = DispatchQueue(label: "com.convex.network-monitor")
+      monitor.start(queue: queue)
+    }
+
+    await performRefreshWithRetry()
+  }
+  #endif
+
   private func performRefreshWithRetry(retryAttempt: Int = 0) async {
     guard let authData = currentAuthData else {
       return
@@ -198,7 +246,17 @@ class TokenRefreshManager<T> {
       // Provider doesn't support refresh
       return
     } catch {
+      let isOffline = isOfflineError(error)
       let isTransient = isTransientError(error)
+
+      #if canImport(Network)
+      if isOffline {
+        // Device is offline - wait for network to come back instead of logging out
+        isRefreshing = false
+        await waitForNetworkAndRetry()
+        return
+      }
+      #endif
 
       // Retry transient errors with exponential backoff
       if isTransient && retryAttempt < maxRetries {
