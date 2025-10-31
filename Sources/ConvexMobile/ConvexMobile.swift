@@ -4,6 +4,9 @@
 import Combine
 import Foundation
 @_exported import UniFFI
+#if canImport(UIKit)
+import UIKit
+#endif
 
 // MARK: - JWT Helper
 
@@ -44,6 +47,9 @@ class TokenRefreshManager<T> {
   private var refreshTimer: AnyCancellable?
   private var currentAuthData: T?
   private let refreshLeewaySeconds: TimeInterval
+  #if canImport(UIKit)
+  private var appLifecycleObserver: NSObjectProtocol?
+  #endif
 
   init(
     authProvider: any AuthProvider<T>,
@@ -55,6 +61,26 @@ class TokenRefreshManager<T> {
     self.refreshLeewaySeconds = refreshLeewaySeconds
     self.onTokenRefreshed = onTokenRefreshed
     self.onRefreshFailed = onRefreshFailed
+
+    #if canImport(UIKit)
+    appLifecycleObserver = NotificationCenter.default.addObserver(
+      forName: UIApplication.willEnterForegroundNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      Task {
+        await self?.handleAppResume()
+      }
+    }
+    #endif
+  }
+
+  deinit {
+    #if canImport(UIKit)
+    if let observer = appLifecycleObserver {
+      NotificationCenter.default.removeObserver(observer)
+    }
+    #endif
   }
 
   func startMonitoring(authData: T) {
@@ -90,6 +116,22 @@ class TokenRefreshManager<T> {
     refreshTimer?.cancel()
     refreshTimer = nil
     currentAuthData = nil
+  }
+
+  private func handleAppResume() async {
+    guard let authData = currentAuthData else {
+      return
+    }
+
+    let token = authProvider.extractIdToken(from: authData)
+    guard let expirationDate = JWTDecoder.extractExpiration(from: token) else {
+      return
+    }
+
+    let timeUntilExpiration = expirationDate.timeIntervalSinceNow
+    if timeUntilExpiration <= refreshLeewaySeconds {
+      await performRefresh()
+    }
   }
 
   private func performRefresh() async {
