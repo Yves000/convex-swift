@@ -40,6 +40,44 @@ private struct JWTDecoder {
   }
 }
 
+// MARK: - Token Refresh Coordinator
+
+/// Actor-based coordinator to prevent concurrent token refresh operations.
+/// Ensures only one refresh can execute at a time, preventing race conditions
+/// when multiple triggers (timer, app resume) attempt simultaneous refreshes.
+private actor TokenRefreshCoordinator {
+  private var isRefreshing = false
+  private var lastRefreshAttempt: Date?
+  private let minimumRefreshInterval: TimeInterval = 5.0
+
+  /// Attempts to acquire the refresh lock.
+  /// Returns true if refresh should proceed, false if already in progress or too recent.
+  func shouldPerformRefresh() -> Bool {
+    // Already refreshing - skip
+    if isRefreshing {
+      return false
+    }
+
+    // Check if we recently attempted a refresh (debouncing)
+    if let lastAttempt = lastRefreshAttempt {
+      let timeSinceLastAttempt = Date().timeIntervalSince(lastAttempt)
+      if timeSinceLastAttempt < minimumRefreshInterval {
+        return false
+      }
+    }
+
+    // Acquire lock
+    isRefreshing = true
+    lastRefreshAttempt = Date()
+    return true
+  }
+
+  /// Releases the refresh lock after completion.
+  func completeRefresh() {
+    isRefreshing = false
+  }
+}
+
 // MARK: - Token Refresh Manager
 
 /// Manages automatic token refresh for authenticated Convex clients.
@@ -52,7 +90,7 @@ class TokenRefreshManager<T> {
   private let refreshLeewaySeconds: TimeInterval
   private let maxRetries: Int
   private let baseRetryDelay: TimeInterval
-  private var isRefreshing = false
+  private let refreshCoordinator = TokenRefreshCoordinator()
   #if canImport(UIKit)
   private var appLifecycleObserver: NSObjectProtocol?
   #endif
@@ -131,6 +169,23 @@ class TokenRefreshManager<T> {
     return false
   }
 
+  private func isAuthenticationError(_ error: Error) -> Bool {
+    let nsError = error as NSError
+
+    // HTTP 401 Unauthorized
+    if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorUserAuthenticationRequired {
+      return true
+    }
+
+    // Check for WorkOS-specific auth errors in the error description
+    let errorDescription = error.localizedDescription.lowercased()
+    return errorDescription.contains("invalid_grant") ||
+           errorDescription.contains("invalid_client") ||
+           errorDescription.contains("unauthorized") ||
+           errorDescription.contains("invalid_token") ||
+           errorDescription.contains("refresh token already exchanged")
+  }
+
   func startMonitoring(authData: T) {
     stopMonitoring()
     currentAuthData = authData
@@ -167,7 +222,6 @@ class TokenRefreshManager<T> {
     refreshTimer?.cancel()
     refreshTimer = nil
     currentAuthData = nil
-    isRefreshing = false
   }
 
   private func handleAppResume() async {
@@ -221,17 +275,20 @@ class TokenRefreshManager<T> {
   #endif
 
   private func performRefreshWithRetry(retryAttempt: Int = 0) async {
+    // Check with coordinator if we should proceed with refresh
+    guard await refreshCoordinator.shouldPerformRefresh() else {
+      return
+    }
+
+    // Perform the actual refresh, ensuring we always release the lock
+    await performRefreshOperation(retryAttempt: retryAttempt)
+    await refreshCoordinator.completeRefresh()
+  }
+
+  private func performRefreshOperation(retryAttempt: Int) async {
     guard let authData = currentAuthData else {
       return
     }
-
-    // Prevent concurrent refresh attempts
-    guard !isRefreshing else {
-      return
-    }
-
-    isRefreshing = true
-    defer { isRefreshing = false }
 
     do {
       let newAuthData = try await authProvider.refreshToken(from: authData)
@@ -252,20 +309,45 @@ class TokenRefreshManager<T> {
       #if canImport(Network)
       if isOffline {
         // Device is offline - wait for network to come back instead of logging out
-        isRefreshing = false
+        await refreshCoordinator.completeRefresh()
         await waitForNetworkAndRetry()
         return
       }
       #endif
 
+      // Check if this is an authentication error that requires logout
+      let isAuthError = isAuthenticationError(error)
+
+      if isAuthError {
+        // Authentication error - credentials are invalid, logout immediately
+        #if DEBUG
+        print("[TokenRefresh] Authentication error detected, logging out: \(error.localizedDescription)")
+        #endif
+        onRefreshFailed(error)
+        return
+      }
+
       // Retry transient errors with exponential backoff
       if isTransient && retryAttempt < maxRetries {
         let delay = baseRetryDelay * pow(2.0, Double(retryAttempt))
-        isRefreshing = false
+        #if DEBUG
+        print("[TokenRefresh] Transient error, retrying in \(delay)s (attempt \(retryAttempt + 1)/\(maxRetries))")
+        #endif
+        await refreshCoordinator.completeRefresh()
         try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
         await performRefreshWithRetry(retryAttempt: retryAttempt + 1)
+      } else if isTransient {
+        // Max retries exceeded for transient error - log but DON'T logout
+        #if DEBUG
+        print("[TokenRefresh] Max retries exceeded for transient error, keeping user logged in")
+        print("[TokenRefresh] Error: \(error.localizedDescription)")
+        #endif
+        // User stays logged in, will retry on next scheduled refresh or app resume
       } else {
-        // Permanent error or max retries exceeded
+        // Unknown permanent error - log and logout to be safe
+        #if DEBUG
+        print("[TokenRefresh] Unknown permanent error, logging out: \(error.localizedDescription)")
+        #endif
         onRefreshFailed(error)
       }
     }
@@ -581,7 +663,40 @@ public class ConvexClientWithAuth<T>: ConvexClient {
   private func login(strategy: LoginStrategy) async -> Result<T, Error> {
     authPublisher.send(AuthState.loading)
     do {
-      let authData = try await strategy()
+      var authData = try await strategy()
+
+      // Check if token is expired and refresh it before using
+      let token = authProvider.extractIdToken(from: authData)
+      if let expirationDate = JWTDecoder.extractExpiration(from: token) {
+        let timeUntilExpiration = expirationDate.timeIntervalSinceNow
+
+        // If token is already expired or expires within 10 seconds, refresh immediately
+        if timeUntilExpiration <= 10 {
+          #if DEBUG
+          print("[ConvexAuth] Token expired or expiring soon (\(Int(timeUntilExpiration))s), refreshing before authentication...")
+          #endif
+
+          do {
+            authData = try await authProvider.refreshToken(from: authData)
+            #if DEBUG
+            print("[ConvexAuth] Token refreshed successfully before authentication")
+            #endif
+          } catch AuthProviderError.refreshNotSupported {
+            // Provider doesn't support refresh, proceed with existing token
+            #if DEBUG
+            print("[ConvexAuth] Token refresh not supported, proceeding with existing token")
+            #endif
+          } catch {
+            // Refresh failed, but we'll still try with the existing token
+            // TokenRefreshManager will handle further refresh attempts
+            #if DEBUG
+            print("[ConvexAuth] Token refresh failed: \(error.localizedDescription)")
+            print("[ConvexAuth] Proceeding with existing token, automatic refresh will retry")
+            #endif
+          }
+        }
+      }
+
       try await ffiClient.setAuth(token: authProvider.extractIdToken(from: authData))
 
       // Start monitoring token expiration for automatic refresh
