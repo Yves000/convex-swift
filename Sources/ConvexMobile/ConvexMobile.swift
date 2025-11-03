@@ -663,40 +663,7 @@ public class ConvexClientWithAuth<T>: ConvexClient {
   private func login(strategy: LoginStrategy) async -> Result<T, Error> {
     authPublisher.send(AuthState.loading)
     do {
-      var authData = try await strategy()
-
-      // Check if token is expired and refresh it before using
-      let token = authProvider.extractIdToken(from: authData)
-      if let expirationDate = JWTDecoder.extractExpiration(from: token) {
-        let timeUntilExpiration = expirationDate.timeIntervalSinceNow
-
-        // If token is already expired or expires within 10 seconds, refresh immediately
-        if timeUntilExpiration <= 10 {
-          #if DEBUG
-          print("[ConvexAuth] Token expired or expiring soon (\(Int(timeUntilExpiration))s), refreshing before authentication...")
-          #endif
-
-          do {
-            authData = try await authProvider.refreshToken(from: authData)
-            #if DEBUG
-            print("[ConvexAuth] Token refreshed successfully before authentication")
-            #endif
-          } catch AuthProviderError.refreshNotSupported {
-            // Provider doesn't support refresh, proceed with existing token
-            #if DEBUG
-            print("[ConvexAuth] Token refresh not supported, proceeding with existing token")
-            #endif
-          } catch {
-            // Refresh failed, but we'll still try with the existing token
-            // TokenRefreshManager will handle further refresh attempts
-            #if DEBUG
-            print("[ConvexAuth] Token refresh failed: \(error.localizedDescription)")
-            print("[ConvexAuth] Proceeding with existing token, automatic refresh will retry")
-            #endif
-          }
-        }
-      }
-
+      let authData = try await strategy()
       try await ffiClient.setAuth(token: authProvider.extractIdToken(from: authData))
 
       // Start monitoring token expiration for automatic refresh
