@@ -13,9 +13,7 @@ import Network
 
 // MARK: - JWT Helper
 
-/// Helper struct to decode JWT tokens and extract expiration information
 private struct JWTDecoder {
-  /// Decodes a JWT token and returns the expiration date if available
   static func extractExpiration(from token: String) -> Date? {
     let segments = token.components(separatedBy: ".")
     guard segments.count >= 2 else {
@@ -50,15 +48,11 @@ private actor TokenRefreshCoordinator {
   private var lastRefreshAttempt: Date?
   private let minimumRefreshInterval: TimeInterval = 5.0
 
-  /// Attempts to acquire the refresh lock.
-  /// Returns true if refresh should proceed, false if already in progress or too recent.
   func shouldPerformRefresh() -> Bool {
-    // Already refreshing - skip
     if isRefreshing {
       return false
     }
 
-    // Check if we recently attempted a refresh (debouncing)
     if let lastAttempt = lastRefreshAttempt {
       let timeSinceLastAttempt = Date().timeIntervalSince(lastAttempt)
       if timeSinceLastAttempt < minimumRefreshInterval {
@@ -66,13 +60,11 @@ private actor TokenRefreshCoordinator {
       }
     }
 
-    // Acquire lock
     isRefreshing = true
     lastRefreshAttempt = Date()
     return true
   }
 
-  /// Releases the refresh lock after completion.
   func completeRefresh() {
     isRefreshing = false
   }
@@ -172,12 +164,10 @@ class TokenRefreshManager<T> {
   private func isAuthenticationError(_ error: Error) -> Bool {
     let nsError = error as NSError
 
-    // HTTP 401 Unauthorized
     if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorUserAuthenticationRequired {
       return true
     }
 
-    // Check for WorkOS-specific auth errors in the error description
     let errorDescription = error.localizedDescription.lowercased()
     return errorDescription.contains("invalid_grant") ||
            errorDescription.contains("invalid_client") ||
@@ -199,7 +189,6 @@ class TokenRefreshManager<T> {
     let timeUntilRefresh = max(0, timeUntilExpiration - refreshLeewaySeconds)
 
     if timeUntilRefresh <= 0 {
-      // Token already expired - wait briefly for network to stabilize before refreshing
       let networkStabilizationDelay: TimeInterval = 3.0
       Task { [weak self] in
         try? await Task.sleep(nanoseconds: UInt64(networkStabilizationDelay * 1_000_000_000))
@@ -275,12 +264,10 @@ class TokenRefreshManager<T> {
   #endif
 
   private func performRefreshWithRetry(retryAttempt: Int = 0) async {
-    // Check with coordinator if we should proceed with refresh
     guard await refreshCoordinator.shouldPerformRefresh() else {
       return
     }
 
-    // Perform the actual refresh, ensuring we always release the lock
     await performRefreshOperation(retryAttempt: retryAttempt)
     await refreshCoordinator.completeRefresh()
   }
@@ -296,11 +283,8 @@ class TokenRefreshManager<T> {
 
       currentAuthData = newAuthData
       try await onTokenRefreshed(newToken)
-
-      // Schedule next refresh
       startMonitoring(authData: newAuthData)
     } catch AuthProviderError.refreshNotSupported {
-      // Provider doesn't support refresh
       return
     } catch {
       let isOffline = isOfflineError(error)
@@ -308,46 +292,27 @@ class TokenRefreshManager<T> {
 
       #if canImport(Network)
       if isOffline {
-        // Device is offline - wait for network to come back instead of logging out
         await refreshCoordinator.completeRefresh()
         await waitForNetworkAndRetry()
         return
       }
       #endif
 
-      // Check if this is an authentication error that requires logout
       let isAuthError = isAuthenticationError(error)
 
       if isAuthError {
-        // Authentication error - credentials are invalid, logout immediately
-        #if DEBUG
-        print("[TokenRefresh] Authentication error detected, logging out: \(error.localizedDescription)")
-        #endif
         onRefreshFailed(error)
         return
       }
 
-      // Retry transient errors with exponential backoff
       if isTransient && retryAttempt < maxRetries {
         let delay = baseRetryDelay * pow(2.0, Double(retryAttempt))
-        #if DEBUG
-        print("[TokenRefresh] Transient error, retrying in \(delay)s (attempt \(retryAttempt + 1)/\(maxRetries))")
-        #endif
         await refreshCoordinator.completeRefresh()
         try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
         await performRefreshWithRetry(retryAttempt: retryAttempt + 1)
       } else if isTransient {
-        // Max retries exceeded for transient error - log but DON'T logout
-        #if DEBUG
-        print("[TokenRefresh] Max retries exceeded for transient error, keeping user logged in")
-        print("[TokenRefresh] Error: \(error.localizedDescription)")
-        #endif
-        // User stays logged in, will retry on next scheduled refresh or app resume
+        // Max retries exceeded - keep user logged in, will retry on next scheduled refresh
       } else {
-        // Unknown permanent error - log and logout to be safe
-        #if DEBUG
-        print("[TokenRefresh] Unknown permanent error, logging out: \(error.localizedDescription)")
-        #endif
         onRefreshFailed(error)
       }
     }
@@ -555,20 +520,7 @@ public protocol AuthProvider<T> {
   func refreshToken(from authResult: T) async throws -> T
 }
 
-/// Default implementation of ``AuthProvider`` optional methods.
 extension AuthProvider {
-  /// Default implementation that throws ``AuthProviderError/refreshNotSupported``.
-  ///
-  /// Override this method in your AuthProvider implementation to enable automatic token refresh.
-  ///
-  /// Example:
-  /// ```swift
-  /// extension MyAuthProvider {
-  ///   public func refreshToken(from authResult: Credentials) async throws -> Credentials {
-  ///     return try await myAPI.refreshToken(authResult.refreshToken)
-  ///   }
-  /// }
-  /// ```
   public func refreshToken(from authResult: T) async throws -> T {
     throw AuthProviderError.refreshNotSupported
   }
