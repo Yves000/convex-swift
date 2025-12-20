@@ -214,18 +214,38 @@ class TokenRefreshManager<T> {
   }
 
   private func handleAppResume() async {
-    guard let authData = currentAuthData else {
-      return
-    }
+    // On app resume: Load fresh credentials from keychain instead of using in-memory data.
+    // This prevents "refresh token already exchanged" errors when the token was already
+    // refreshed in the background.
+    do {
+      let freshAuthData = try await authProvider.loginFromCache()
+      currentAuthData = freshAuthData
 
-    let token = authProvider.extractIdToken(from: authData)
-    guard let expirationDate = JWTDecoder.extractExpiration(from: token) else {
-      return
-    }
+      let token = authProvider.extractIdToken(from: freshAuthData)
+      guard let expirationDate = JWTDecoder.extractExpiration(from: token) else {
+        return
+      }
 
-    let timeUntilExpiration = expirationDate.timeIntervalSinceNow
-    if timeUntilExpiration <= refreshLeewaySeconds {
-      await performRefreshWithRetry()
+      let timeUntilExpiration = expirationDate.timeIntervalSinceNow
+      if timeUntilExpiration <= refreshLeewaySeconds {
+        await performRefreshWithRetry()
+      }
+    } catch {
+      // loginFromCache already attempted to refresh if needed.
+      // On error: Fall back to existing in-memory credentials.
+      guard let authData = currentAuthData else {
+        return
+      }
+
+      let token = authProvider.extractIdToken(from: authData)
+      guard let expirationDate = JWTDecoder.extractExpiration(from: token) else {
+        return
+      }
+
+      let timeUntilExpiration = expirationDate.timeIntervalSinceNow
+      if timeUntilExpiration <= refreshLeewaySeconds {
+        await performRefreshWithRetry()
+      }
     }
   }
 
@@ -301,8 +321,21 @@ class TokenRefreshManager<T> {
       let isAuthError = isAuthenticationError(error)
 
       if isAuthError {
-        onRefreshFailed(error)
-        return
+        // Last resort: Try loading fresh credentials from keychain.
+        // This can help when the in-memory token was stale.
+        do {
+          let freshAuthData = try await authProvider.loginFromCache()
+          currentAuthData = freshAuthData
+          let freshToken = authProvider.extractIdToken(from: freshAuthData)
+          try await onTokenRefreshed(freshToken)
+          startMonitoring(authData: freshAuthData)
+          // Success - no logout needed
+          return
+        } catch {
+          // loginFromCache also failed - credentials are truly invalid
+          onRefreshFailed(error)
+          return
+        }
       }
 
       if isTransient && retryAttempt < maxRetries {
@@ -581,6 +614,30 @@ public class ConvexClientWithAuth<T>: ConvexClient {
   /// depending on the result.
   public func login() async -> Result<T, Error> {
     await login(strategy: authProvider.login)
+  }
+
+  /// Triggers a custom login flow using the provided strategy and updates the ``authState``.
+  ///
+  /// Use this method when you need to customize the login flow, such as using a specific
+  /// OAuth provider instead of the default authentication.
+  ///
+  /// The ``authState`` is set to ``AuthState.loading`` immediately upon calling this method and
+  /// will change to either ``AuthState.authenticated`` or ``AuthState.unauthenticated``
+  /// depending on the result.
+  ///
+  /// - Parameter strategy: A closure that performs the authentication and returns credentials.
+  /// - Returns: A ``Result`` containing the authentication data on success or an error.
+  ///
+  /// ## Example
+  ///
+  /// ```swift
+  /// // Login with a specific OAuth provider
+  /// let result = await client.login {
+  ///     try await provider.login(provider: .google)
+  /// }
+  /// ```
+  public func login(using strategy: @escaping () async throws -> T) async -> Result<T, Error> {
+    await login(strategy: strategy)
   }
 
   /// Triggers a cached, UI-less re-authentication flow using previously stored credentials and updates the
